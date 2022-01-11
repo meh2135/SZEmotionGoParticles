@@ -1,0 +1,32 @@
+ambiguous:
+- realization
+- surprise
+- confusion
+- curiosity
+negative:
+- anger
+- annoyance
+- disappointment
+- disapproval
+- disgust
+- embarrassment
+- fear
+- grief
+- nervousness
+- remorse
+- sadness
+neutral:
+- neutral
+positive:
+- admiration
+- amusement
+- approval
+- caring
+- desire
+- excitement
+- gratitude
+- joy
+- love
+- optimism
+- pride
+- relief
