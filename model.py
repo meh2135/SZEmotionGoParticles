@@ -1,19 +1,27 @@
 import pathlib
 import numpy as np
 import pandas as pd
-import pymc3 as pm
 import theano.tensor as tt
+import pymc3 as pm
 import arviz as az
 from theano import tensor as tt
-from . import preprocess
+import preprocess
 
 coarse_emo_list = preprocess.coarse_emo_list
 emotion_labels = coarse_emo_list
 
 
-def bayesian_model(df: pd.DataFrame, drop_ot: bool =False, dfac: float=1.5) -> pm.Model:
+def bayesian_model(df: pd.DataFrame, include_ot: bool =True, inv_alpha: float=1.5, normalized: bool: True) -> pm.Model:
+  """Builds a pymc3 emotion particle model.
+  
+  Incoming dataframe should have the following columns:
+    pid: person id
+    dc: drug+condition. OT, PL, or HC.
+    stim: the name (or number) of the stimulus
+    *numerical columns for each entry in coarse_emo_list* these should sum to 1.
+  """
   df = df.copy()
-  if drop_ot:
+  if not include_ot:
     df = df[df["dc"] != "OT"].reset_index(drop=True)
 
   sz_idx, sz_names = pd.factorize(df["dc"], sort=True)
@@ -33,19 +41,17 @@ def bayesian_model(df: pd.DataFrame, drop_ot: bool =False, dfac: float=1.5) -> p
     # Normative vectors
     normative_emo = pm.Dirichlet(
           "normative_emo",
-          a=np.ones(len(emotion_labels), dtype=np.float32) / (dfac * len(emotion_labels)),
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
           dims=["stim", "emo"],
       )
       # SZ Rotation
     beta = pm.Dirichlet(
           "beta",
-          a=np.ones(len(emotion_labels), dtype=np.float32) / (dfac * len(emotion_labels)),
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
           dims=["emo", "emo_to"],
       )
 
-    dummy_mapper = pm.Data(
-          "dummy_mapper", np.eye(len(emotion_labels)), dims=["emo", "emo_to"]
-      )
+
     # Random effects
     # Prior on the diagonal parameters of the random rotation effect 
     # dirichlet dist
@@ -90,11 +96,11 @@ def bayesian_model(df: pd.DataFrame, drop_ot: bool =False, dfac: float=1.5) -> p
     mu = ((1.0 - sz_bool[..., :, None]) * normative_emo_trial) + (sz_bool[..., :, None] * group_perturbation)  # dims=["trial", "emo"]
 
 
-    if not drop_ot:
+    if include_ot:
 
       beta_drug = pm.Dirichlet(
         "beta_drug",
-        a=np.ones(len(emotion_labels), dtype=np.float32) / (dfac * len(emotion_labels)),
+        a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
         dims=["emo", "emo_to"],
       )
       normative_emo_drug_perturbation_trial = tt.sum(
@@ -132,13 +138,13 @@ if __name__=="__main__":
         df[coarse_emo_list].sum(1), 0
     )
 
-    drop_ot = False
-    model = bayesian_model(df, drop_ot, 1.0)
+    include_ot = True
+    model = bayesian_model(df, include_ot, 1.0)
     temp_trace = pm.sample(
         1500, model=model, return_inferencedata=True, tune=2500, chains=4
     )
     trace_vars = ["re_diag", "re_rest", "beta", "obs_mag", "normative_emo"]
-    if not drop_ot:
+    if include_ot:
         trace_vars.append("beta_drug")
     az.plot_trace(
         temp_trace,
