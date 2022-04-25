@@ -5,33 +5,43 @@ import pandas as pd
 import yaml
 import pathlib
 from typing import Optional
-coarse_to_fine_emo_map_path = pathlib.Path("./coarse_to_fine_emo_map.yaml")
-with coarse_to_fine_emo_map_path.open("r") as fl:
-    coarse_to_fine_emo_map = yaml.load(fl)
-coarse_emo_list = list(coarse_to_fine_emo_map.keys())
+from scipy.special import logit
+from typing import List, Dict
+default_coarse_to_fine_emo_map_path = pathlib.Path("./coarse_to_fine_emo_map.yaml")
 
-def fine_to_coarse(df: pd.DataFrame, 
-                   agg_power: Optional[float] = None,
-                   normalize: bool = True,
-                   sigmoid_scale: float = 1.0) -> pd.DataFrame:
-    # Grab the non-emotion-value columns
-    coarse_emo_df_dict = {"pid":df["id"], "stim":df["stim"], "dc":df["drugCondition"]}
-    if agg_power is not None and agg_power>0:
-        for coarse, fine_list in coarse_to_fine_emo_map.items():
-            coarse_emo_df_dict[coarse] = (df[fine_list]**agg_power).sum(1)
+def fix_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.set_index(["id", "stimulus.x", "drugCondition"])
+    df.index.names = ["pid", "stim", "dc"]
+    return df
+
+
+def normalize(df: pd.DataFrame, logit_first: bool =True, power: Optional[float] =None) -> pd.DataFrame:
+    if logit_first and power is not None:
+        raise ValueError("Taking the logit first will cause most values to be negative. Need to exp!")
+    if logit_first:
+        df = logit(df)
+    if power is None:
+        unscaled_df = np.exp(df)
     else:
-        all_fine = list(itertools.chain.from_iterable(coarse_to_fine_emo_map.values()))
-        all_fine_exp_vals = np.exp(sigmoid_scale * df[all_fine])
-        fine_dist_vals = all_fine_exp_vals.divide(all_fine_exp_vals.sum(1), 0)
-        for coarse, fine_list in coarse_to_fine_emo_map.items():
-            coarse_emo_df_dict[coarse] = (fine_dist_vals[fine_list]).sum(1)
-    # Construct coarse emotion dataframe
-    coarse_emo_df = pd.DataFrame(coarse_emo_df_dict)
-    # Extract the rater assigned valence for each stimulus
-    coarse_emo_df["stim_rating"] = coarse_emo_df["stim"].str.extract("([a-z]{3})_")
-    # Normalize so that the sum of the 4 coarse emotions=1 for each trial.
-    if normalize and agg_power is not None and agg_power > 0:
-        coarse_emo_df[coarse_emo_list] = coarse_emo_df[coarse_emo_list].divide(coarse_emo_df[coarse_emo_list].sum(1), 0)
-    # Clear the old index
-    coarse_emo_df = coarse_emo_df.reset_index(drop=True)
-    return coarse_emo_df
+        unscaled_df = df ** power
+    return unscaled_df.divide(unscaled_df.sum(1), axis=0)
+
+
+def coarsen(df: pd.DataFrame, coarse_to_fine_emo_map: Dict[str, List[str]]) -> pd.DataFrame:
+    return pd.DataFrame({coarse_emo: df[fine_emo_list].sum(1) for coarse_emo, fine_emo_list in coarse_to_fine_emo_map.items()})
+
+def bound(df: pd.DataFrame, delta: float) -> pd.DataFrame:
+    df[df<delta] = delta
+    df[df > (1.0 - delta)] = 1.0 - delta
+    return df
+
+def preprocess(df: pd.DataFrame, 
+               logit_first: bool = True, 
+               power: Optional[float] = None, 
+               delta: float=1e-5, 
+               emo_map_path: pathlib.Path = default_coarse_to_fine_emo_map_path
+               ) -> pd.DataFrame:
+    with emo_map_path.open("r") as fl:
+        coarse_to_fine_emo_map = yaml.load(fl)
+    clean_df = normalize(fix_column_names(df), logit_first, power)
+    return bound(coarsen(clean_df, coarse_to_fine_emo_map), delta)

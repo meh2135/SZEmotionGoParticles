@@ -5,13 +5,11 @@ import theano.tensor as tt
 import pymc3 as pm
 import arviz as az
 from theano import tensor as tt
-import preprocess
-
-coarse_emo_list = preprocess.coarse_emo_list
-emotion_labels = coarse_emo_list
+import preprocess as go_preprocess
+from typing import List
 
 
-def bayesian_model(df: pd.DataFrame, include_ot: bool =True, inv_alpha: float=1.5, normalized: bool: True) -> pm.Model:
+def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool =True, inv_alpha: float=1.5) -> pm.Model:
   """Builds a pymc3 emotion particle model.
   
   Incoming dataframe should have the following columns:
@@ -127,30 +125,29 @@ if __name__=="__main__":
     data_path = pathlib.Path("go_emotions_output_clean.csv")
     with data_path.open("r") as fl:
         raw_data = pd.read_csv(fl)
-    df = preprocess.fine_to_coarse(raw_data)
-
-    eps = 1e-6
-    for emo in coarse_emo_list:
-        df.loc[df[emo] < eps, emo] = eps
-        df.loc[df[emo] > 1.0 - eps, emo] = 1.0 - eps
-
-    df[coarse_emo_list] = df[coarse_emo_list].divide(
-        df[coarse_emo_list].sum(1), 0
-    )
+    df = go_preprocess.preprocess(raw_data, logit_first=False, power=1.0)
 
     include_ot = True
-    model = bayesian_model(df, include_ot, 1.0)
-    temp_trace = pm.sample(
-        1500, model=model, return_inferencedata=True, tune=2500, chains=4
-    )
+    model = bayesian_model(df.reset_index(), list(df.columns), include_ot=include_ot, inv_alpha=1.0)
+    samples = pm.sample(
+        2500, 
+        model=model, 
+        return_inferencedata=True, 
+        tune=2500, 
+        chains=4, 
+        init="advi+adapt_diag",
+      )
     trace_vars = ["re_diag", "re_rest", "beta", "obs_mag", "normative_emo"]
     if include_ot:
         trace_vars.append("beta_drug")
     az.plot_trace(
-        temp_trace,
+        samples,
         var_names=trace_vars,
         compact=True,
     )
-
-    # display(temp_trace.posterior["beta"].mean(["chain", "draw"]).to_series().unstack())
-    # display(temp_trace.posterior["beta_drug"].mean(["chain", "draw"]).to_series().unstack())
+    az.plot_trace(
+        samples,
+        var_names=["beta"],
+        compact=False,
+    )
+    
