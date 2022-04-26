@@ -1,4 +1,5 @@
 import pathlib
+from xml.etree.ElementInclude import include
 import numpy as np
 import pandas as pd
 import theano.tensor as tt
@@ -6,7 +7,8 @@ import pymc3 as pm
 import arviz as az
 from theano import tensor as tt
 import preprocess as go_preprocess
-from typing import List
+from typing import Dict, List
+import argparse
 
 
 def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool =True, inv_alpha: float=1.5) -> pm.Model:
@@ -121,20 +123,153 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
                  dims=["trial", "emo"],)
   return model
 
-if __name__=="__main__":
-    data_path = pathlib.Path("go_emotions_output_clean.csv")
-    with data_path.open("r") as fl:
-        raw_data = pd.read_csv(fl)
-    df = go_preprocess.preprocess(raw_data, logit_first=False, power=1.0)
+def get_sz_kludge(df: pd.DataFrame) -> Dict[int, str]:
+  df = df[df["dc"] != "OT"].reset_index(drop=True)
+  pid_dc_mapper = {pid_dc[0]:pid_dc[1] for pid_dc, _ in df.groupby(["pid", "dc"])}
+  return pid_dc_mapper
 
-    include_ot = True
-    model = bayesian_model(df.reset_index(), list(df.columns), include_ot=include_ot, inv_alpha=1.0)
+def additive_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool =False,  inv_alpha: float=1.5) -> pm.Model:
+  """Builds a pymc3 emotion particle model with one screen (person, drugcondition), generated from an multiplicative parameter.
+  
+  Incoming dataframe should have the following columns:
+    pid: person id
+    dc: drug+condition. OT, PL, or HC.
+    stim: the name (or number) of the stimulus
+    *numerical columns for each entry in coarse_emo_list* these should sum to 1.
+  """
+  df = df.copy()
+  if not include_ot:
+    df = df[df["dc"] != "OT"].reset_index(drop=True)
+
+  sz_idx, sz_names = pd.factorize(df["dc"], sort=True)
+  stim_idx, stim_names = pd.factorize(df["stim"], sort=True)
+  pid_idx, pid_names = pd.factorize(df["pid"], sort=True, )
+  dc_map = get_sz_kludge(df)
+  pid_indexed_dc = pd.Series([dc_map[pid] for pid in pid_names], index=pid_names)
+  with pm.Model(
+      coords={
+          "pid": pid_names,
+          "sz": sz_names,
+          "stim": stim_names,
+          "emo": emotion_labels,
+          "emo_to": emotion_labels,
+          "trial": np.arange(len(df)),
+      }
+  ) as model:
+    emotion_go_vals = pm.Data("emotion_go_vals", value=df[emotion_labels], dims=["trial", "emo"],)
+    sz_bool = pm.Data("sz_bool", value=(pid_indexed_dc=="PL").astype(float).values, dims=["pid"])
+    # if include_ot:
+    #   ot_bool = pm.Data("ot_bool", value=(pid_indexed_dc=="OT").astype(float).values, dims=["pid"])
+    # Normative vectors
+    normative_emo = pm.Dirichlet(
+          "normative_emo",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=["stim", "emo"],
+      )
+    # SZ amplifiers
+    beta_multipliers = pm.HalfNormal(name="beta_multipliers", 
+                                      sigma=np.sqrt(np.pi / 2.0),
+                                    dims=["emo", "emo_to"],)
+    if include_ot:
+
+      # OT amplifiers
+      beta_ot_multipliers = pm.HalfNormal(name="beta_ot_multipliers", 
+                                        sigma=np.sqrt(np.pi / 2.0),
+                                      dims=["emo", "emo_to"],)
+
+    # Random effects
+    # Prior on the diagonal parameters of the random rotation effect 
+    # dirichlet dist
+    re_diag_mu  = 10.0
+    re_diag = pm.Gamma("re_diag", mu=re_diag_mu, sigma=re_diag_mu / np.sqrt(2))
+
+    # Prior on the off-center parameters of the random rotation effect 
+    # dirichlet dist
+    re_rest_mu = 1.0
+    re_rest = pm.Gamma("re_rest", mu=re_rest_mu, sigma = re_rest_mu / np.sqrt(2))
+
+    # Control background rates of mislabeling
+    rotation_alpha_base = (
+              re_rest
+              * np.ones((len(emotion_labels), len(emotion_labels)), dtype=np.float32)
+          )
+    # Control rates of correct classificaiton.
+    rotation_alpha_base = rotation_alpha_base     + (re_diag * np.eye(len(emotion_labels), dtype=np.float32))
+    rotation_alpha_base = pm.Deterministic(name="rotation_alpha_base", var=rotation_alpha_base, dims=["emo", "emo_to"])
+    # Amplify rates for SZ
+    rotation_alpha = rotation_alpha_base[..., None, :, :] * (beta_multipliers[..., None, :, :] ** sz_bool[..., None, None])
+    if include_ot:
+      # Amplify rates for OT
+      rotation_alpha = rotation_alpha * (beta_ot_multipliers[None, ...] ** ot_bool[..., None, None])
+    rotation_alpha = pm.Deterministic(name="rotation_alpha", var=rotation_alpha, dims=["pid", "emo", "emo_to"])
+    # Random effects. Tthe diagonals are really re_diag + re_rest, which
+    # ensures that they're larger than the off diagonals. Sort of equivalent
+    # to mean 0 prior on linear random effects?
+    personal_rotation = pm.Dirichlet(
+          "personal_rotation",
+          a=rotation_alpha,
+          dims=["pid", "emo", "emo_to"],
+      )
+    # Expand the random effects to each trial
+    normative_emo_group_perturbation = tt.sum(tt.mul(normative_emo[..., stim_idx, :, None], personal_rotation[..., pid_idx, :, :]), -2 )  # dims=[stim, emo_to]
+
+
+    obs_mag = pm.HalfCauchy("obs_mag", 0.5)
+    pm.Dirichlet("p", 
+                 a=obs_mag * normative_emo_group_perturbation, 
+                 observed=emotion_go_vals, 
+                 dims=["trial", "emo"],)
+  return model
+
+if __name__=="__main__":
+  parser = argparse.ArgumentParser("ModelSampler")
+  parser.add_argument("--additive", action="store_true", help="Use additive model instead.")
+  parser.add_argument("--exclude_ot", action="store_true", help="Exclude oxytocin from model.")
+
+  parser.add_argument("--chains", type=int, default=2, help="sampler chains.")
+
+  parser.add_argument("--samples", type=int, default=1500, help="sampler draws per chain.")
+  parser.add_argument("--tune", type=int, default=1500, help="sampler tuner draws per chain.")
+  parser.add_argument("--input_data", type=str, default="go_emotions_output_clean.csv", help="Input csv")
+  args = parser.parse_args()
+
+  data_path = pathlib.Path(args.input_data)
+  with data_path.open("r") as fl:
+      raw_data = pd.read_csv(fl)
+  df = go_preprocess.preprocess(raw_data, logit_first=False, power=1.0)
+
+  if args.additive:
+
+    model = additive_model(df.reset_index(), list(df.columns), inv_alpha=1.0)
     samples = pm.sample(
-        2500, 
+        args.samples, 
         model=model, 
         return_inferencedata=True, 
-        tune=2500, 
-        chains=4, 
+        tune=args.tune, 
+        chains=args.chains, 
+        init="advi+adapt_diag",
+      )
+    trace_vars = ["re_diag", "re_rest", "beta_multipliers",  "normative_emo"]
+    az.plot_trace(
+        samples,
+        var_names=trace_vars,
+        compact=True,
+    )
+    az.plot_trace(
+        samples,
+        var_names=["beta_multipliers"],
+        compact=False,
+    )
+  else:
+
+    include_ot = not args.exclude_ot
+    model = bayesian_model(df.reset_index(), list(df.columns), include_ot=include_ot, inv_alpha=1.0)
+    samples = pm.sample(
+        args.samples, 
+        model=model, 
+        return_inferencedata=True, 
+        tune=args.tune, 
+        chains=args.chains, 
         init="advi+adapt_diag",
       )
     trace_vars = ["re_diag", "re_rest", "beta", "obs_mag", "normative_emo"]
@@ -150,4 +285,4 @@ if __name__=="__main__":
         var_names=["beta"],
         compact=False,
     )
-    
+  
