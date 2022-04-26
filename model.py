@@ -123,10 +123,6 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
                  dims=["trial", "emo"],)
   return model
 
-def get_sz_kludge(df: pd.DataFrame) -> Dict[int, str]:
-  df = df[df["dc"] != "OT"].reset_index(drop=True)
-  pid_dc_mapper = {pid_dc[0]:pid_dc[1] for pid_dc, _ in df.groupby(["pid", "dc"])}
-  return pid_dc_mapper
 
 def additive_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool =False,  inv_alpha: float=1.5) -> pm.Model:
   """Builds a pymc3 emotion particle model with one screen (person, drugcondition), generated from an multiplicative parameter.
@@ -144,8 +140,6 @@ def additive_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
   sz_idx, sz_names = pd.factorize(df["dc"], sort=True)
   stim_idx, stim_names = pd.factorize(df["stim"], sort=True)
   pid_idx, pid_names = pd.factorize(df["pid"], sort=True, )
-  dc_map = get_sz_kludge(df)
-  pid_indexed_dc = pd.Series([dc_map[pid] for pid in pid_names], index=pid_names)
   with pm.Model(
       coords={
           "pid": pid_names,
@@ -157,7 +151,6 @@ def additive_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
       }
   ) as model:
     emotion_go_vals = pm.Data("emotion_go_vals", value=df[emotion_labels], dims=["trial", "emo"],)
-    sz_bool = pm.Data("sz_bool", value=(pid_indexed_dc=="PL").astype(float).values, dims=["pid"])
     # if include_ot:
     #   ot_bool = pm.Data("ot_bool", value=(pid_indexed_dc=="OT").astype(float).values, dims=["pid"])
     # Normative vectors
@@ -195,23 +188,26 @@ def additive_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
           )
     # Control rates of correct classificaiton.
     rotation_alpha_base = rotation_alpha_base     + (re_diag * np.eye(len(emotion_labels), dtype=np.float32))
-    rotation_alpha_base = pm.Deterministic(name="rotation_alpha_base", var=rotation_alpha_base, dims=["emo", "emo_to"])
+    # rotation_alpha_base = pm.Deterministic(name="rotation_alpha_base", var=rotation_alpha_base, dims=["emo", "emo_to"])
     # Amplify rates for SZ
-    rotation_alpha = rotation_alpha_base[..., None, :, :] * (beta_multipliers[..., None, :, :] ** sz_bool[..., None, None])
+    rotation_alpha_sz = tt.mul(rotation_alpha_base, beta_multipliers)
+    rotation_concat_list = [rotation_alpha_base, rotation_alpha_sz]
+
     if include_ot:
       # Amplify rates for OT
-      rotation_alpha = rotation_alpha * (beta_ot_multipliers[None, ...] ** ot_bool[..., None, None])
-    rotation_alpha = pm.Deterministic(name="rotation_alpha", var=rotation_alpha, dims=["pid", "emo", "emo_to"])
+      rotation_alpha_ot =tt.mul(rotation_alpha_sz, beta_ot_multipliers)
+      rotation_concat_list.append(rotation_alpha_ot)
+    rotation_alpha = pm.Deterministic(name="rotation_alpha", var=tt.stack(rotation_concat_list), dims=["sz", "emo", "emo_to"])
     # Random effects. Tthe diagonals are really re_diag + re_rest, which
     # ensures that they're larger than the off diagonals. Sort of equivalent
     # to mean 0 prior on linear random effects?
     personal_rotation = pm.Dirichlet(
           "personal_rotation",
-          a=rotation_alpha,
-          dims=["pid", "emo", "emo_to"],
+          a=tt.tile(rotation_alpha[None, :, :, : ], [len(pid_names), 1, 1, 1]),
+          dims=["pid", "sz", "emo", "emo_to"],
       )
     # Expand the random effects to each trial
-    normative_emo_group_perturbation = tt.sum(tt.mul(normative_emo[..., stim_idx, :, None], personal_rotation[..., pid_idx, :, :]), -2 )  # dims=[stim, emo_to]
+    normative_emo_group_perturbation = tt.sum(tt.mul(normative_emo[..., stim_idx, :, None], personal_rotation[..., pid_idx, sz_idx,  :, :]), -2 )  # dims=[stim, emo_to]
 
 
     obs_mag = pm.HalfCauchy("obs_mag", 0.5)
