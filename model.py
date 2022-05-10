@@ -11,7 +11,13 @@ from typing import Dict, List
 import argparse
 
 
-def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool =True, inv_alpha: float=1.5) -> pm.Model:
+def bayesian_model(df: pd.DataFrame, 
+                   emotion_labels: List[str], 
+                   include_ot: bool =True, 
+                   inv_alpha: float=1.5, 
+                   random_effects: bool = True, 
+                   flip_beta: bool = False,
+                   stim_beta: bool = False) -> pm.Model:
   """Builds a pymc3 emotion particle model.
   
   Incoming dataframe should have the following columns:
@@ -37,6 +43,7 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
           "trial": np.arange(len(df)),
       }
   ) as model:
+    subject_data = pm.Data("subject_data", value=df["pid"].values, dims=["trial"])
     emotion_go_vals = pm.Data("emotion_go_vals", value=df[emotion_labels], dims=["trial", "emo"],)
     # Normative vectors
     normative_emo = pm.Dirichlet(
@@ -45,37 +52,84 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
           dims=["stim", "emo"],
       )
       # SZ Rotation
-    beta = pm.Dirichlet(
+    if stim_beta and flip_beta:
+      beta_base = pm.Dirichlet(
+          "beta_base",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=[ "emo_to", "emo",],
+      )
+      beta_base_mag = pm.Exponential(name="beta_base_mag", lam=1.0)
+      beta = pm.Dirichlet(
+          "beta",
+          a= beta_base[..., None, :, :] / beta_base_mag,
+          dims=[ "stim", "emo_to", "emo",],
+      )
+      beta = tt.swapaxes(beta, -1, -2)
+    elif flip_beta and not stim_beta:
+      beta = pm.Dirichlet(
+            "beta",
+            a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+            dims=["emo_to", "emo"],
+        )
+      beta = tt.swapaxes(beta, -1, -2)
+    elif stim_beta and not flip_beta:
+      beta_base = pm.Dirichlet(
+          "beta_base",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=[ "emo", "emo_to",],
+      )
+      beta_base_mag = pm.Exponential(name="beta_base_mag", lam=1.0)
+      beta = pm.Dirichlet(
+          "beta",
+          a= beta_base[..., None, :, :] / beta_base_mag,
+          dims=[ "stim", "emo", "emo_to",],
+      )
+    else:
+      beta = pm.Dirichlet(
           "beta",
           a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
           dims=["emo", "emo_to"],
       )
+    
+    
 
+    if random_effects:
+      # Random effects
+      # Prior on the diagonal parameters of the random rotation effect 
+      # dirichlet dist
+      re_diag_mu  = 10.0
+      re_diag = pm.Gamma("re_diag", mu=re_diag_mu, sigma=re_diag_mu / np.sqrt(2))
 
-    # Random effects
-    # Prior on the diagonal parameters of the random rotation effect 
-    # dirichlet dist
-    re_diag_mu  = 10.0
-    re_diag = pm.Gamma("re_diag", mu=re_diag_mu, sigma=re_diag_mu / np.sqrt(2))
-
-    # Prior on the off-center parameters of the random rotation effect 
-    # dirichlet dist
-    re_rest_mu = 1.0
-    re_rest = pm.Gamma("re_rest", mu=re_rest_mu, sigma = re_rest_mu / np.sqrt(2))
-    # Random effects. Tthe diagonals are really re_diag + re_rest, which
-    # ensures that they're larger than the off diagonals. Sort of equivalent
-    # to mean 0 prior on linear random effects?
-    random_effects = pm.Dirichlet(
-          "random_effects",
-          a=(
-              re_rest
-              * np.ones((len(emotion_labels), len(emotion_labels)), dtype=np.float32)
+      # Prior on the off-center parameters of the random rotation effect 
+      # dirichlet dist
+      re_rest_mu = 1.0
+      re_rest = pm.Gamma("re_rest", mu=re_rest_mu, sigma = re_rest_mu / np.sqrt(2))
+      # Random effects. Tthe diagonals are really re_diag + re_rest, which
+      # ensures that they're larger than the off diagonals. Sort of equivalent
+      # to mean 0 prior on linear random effects?
+      if flip_beta:
+        random_effects = pm.Dirichlet(
+              "random_effects",
+              a=(
+                  re_rest
+                  * np.ones((len(emotion_labels), len(emotion_labels)), dtype=np.float32)
+              )
+              + (re_diag * np.eye(len(emotion_labels), dtype=np.float32)),
+              dims=["pid", "emo_to", "emo"],
           )
-          + (re_diag * np.eye(len(emotion_labels), dtype=np.float32)),
-          dims=["pid", "emo", "emo_to"],
-      )
-    # Expand the random effects to each trial
-    re_vals = random_effects[..., pid_idx, :, :]  # dims=["trial", "emo", "emo_to"]
+        random_effects = tt.swapaxes(random_effects, -1, -2)
+      else:
+        random_effects = pm.Dirichlet(
+              "random_effects",
+              a=(
+                  re_rest
+                  * np.ones((len(emotion_labels), len(emotion_labels)), dtype=np.float32)
+              )
+              + (re_diag * np.eye(len(emotion_labels), dtype=np.float32)),
+              dims=["pid", "emo", "emo_to"],
+          )
+      # Expand the random effects to each trial
+      re_vals = random_effects[..., pid_idx, :, :]  # dims=["trial", "emo", "emo_to"]
 
     # To get the group rotated emotions take the base emotions with dims
     # [stim, emo, 1], multiply that by (beta - I) with dims [1, emo, emo_to],
@@ -97,12 +151,46 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
 
 
     if include_ot:
-
-      beta_drug = pm.Dirichlet(
-        "beta_drug",
-        a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
-        dims=["emo", "emo_to"],
-      )
+      if stim_beta and flip_beta:
+        beta_drug_base = pm.Dirichlet(
+          "beta_drug_base",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=[ "emo_to", "emo",],
+        )
+        beta_drug_base_mag = pm.Exponential(name="beta_drug_base_mag", lam=1.0)
+        beta_drug = pm.Dirichlet(
+          "beta_drug",
+          a=beta_drug_base / beta_drug_base_mag,
+          dims=["stim", "emo", "emo_to"],
+        )
+        beta_drug = beta_drug[..., stim_idx, :, :]
+        beta_drug = tt.swapaxes(beta_drug, -1, -2)
+      elif flip_beta and not stim_beta:
+        beta_drug = pm.Dirichlet(
+          "beta_drug",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=["emo_to", "emo"],
+        )
+        beta_drug = tt.swapaxes(beta_drug, -1, -2)
+      elif stim_beta and not flip_beta:
+        beta_drug_base = pm.Dirichlet(
+          "beta_drug_base",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=[ "emo", "emo_to",],
+        )
+        beta_drug_base_mag = pm.Exponential(name="beta_drug_base_mag", lam=1.0)
+        beta_drug = pm.Dirichlet(
+          "beta_drug",
+          a=beta_drug_base / beta_drug_base_mag,
+          dims=["stim", "emo_to", "emo"],
+        )
+        beta_drug = beta_drug[..., stim_idx, :, :]
+      else:
+        beta_drug = pm.Dirichlet(
+          "beta_drug",
+          a=np.ones(len(emotion_labels), dtype=np.float32) / (inv_alpha * len(emotion_labels)),
+          dims=["emo", "emo_to"],
+        )
       normative_emo_drug_perturbation_trial = tt.sum(
         tt.mul(mu[..., None], beta_drug), -2
     )  # dims=[trial, emo_to]
@@ -111,14 +199,19 @@ def bayesian_model(df: pd.DataFrame, emotion_labels: List[str], include_ot: bool
 
       mu = ((1.0 - ot_bool[..., :, None]) * mu) + (ot_bool[..., :, None] * normative_emo_drug_perturbation_trial)
 
-    mu_re = tt.sum(
-        tt.mul(mu[..., :, :, None], re_vals), -2
-    )  # dims=["trial", "emo"]
-
+    if random_effects:
+      mu_re = tt.sum(
+          tt.mul(mu[..., :, :, None], re_vals), -2
+      )  # dims=["trial", "emo"]
+      main_mu = mu_re
+    else:
+      main_mu = mu
     obs_mag = pm.HalfCauchy("obs_mag", 0.5)
 
+    final_alpha = pm.Deterministic(name="final_alpha", var=main_mu * obs_mag, dims=["trial", "emo"])
+
     pm.Dirichlet("p", 
-                 a=mu_re * obs_mag, 
+                 a=final_alpha, 
                  observed=emotion_go_vals, 
                  dims=["trial", "emo"],)
   return model
